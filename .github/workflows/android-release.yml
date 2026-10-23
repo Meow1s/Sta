@@ -48,7 +48,7 @@ jobs:
           retention-days: 7
 
   build-apks:
-    name: 构建 Debug APK
+    name: 构建普通包与 Debug 包
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -59,43 +59,91 @@ jobs:
       - name: 配置构建环境
         uses: ./.github/actions/setup-build
 
-      # fork 无法继承上游仓库的 Actions Secrets，因此这里只构建使用仓库自带
-      # debug 签名的 APK：任何 fork 无需配置 Secrets 即可出包。
-      # 如需发版，请配置 ETA_RELEASE_* Secrets 并恢复 assembleRelease 与 Release 草稿。
-      - name: 构建 Debug APK
+      # 普通包（release）必须签名：优先用仓库 Secrets 中的正式证书；
+      # fork 未配置 Secrets 时退回本次运行临时生成的证书，保证两种包都能产出。
+      # 临时证书每次构建都不同，只适合本机安装，不能用于对外分发。
+      - name: 准备普通包签名
+        env:
+          SECRET_KEYSTORE_BASE64: ${{ secrets.ETA_RELEASE_KEYSTORE_BASE64 }}
+          SECRET_STORE_PASSWORD: ${{ secrets.ETA_RELEASE_STORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.ETA_RELEASE_KEY_ALIAS }}
+          SECRET_KEY_PASSWORD: ${{ secrets.ETA_RELEASE_KEY_PASSWORD }}
+        run: |
+          keystore="$RUNNER_TEMP/eta-release.jks"
+          if [[ -n "$SECRET_KEYSTORE_BASE64" && -n "$SECRET_STORE_PASSWORD" &&
+                -n "$SECRET_KEY_ALIAS" && -n "$SECRET_KEY_PASSWORD" ]]; then
+            printf '%s' "$SECRET_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+            store_password="$SECRET_STORE_PASSWORD"
+            key_alias="$SECRET_KEY_ALIAS"
+            key_password="$SECRET_KEY_PASSWORD"
+          else
+            store_password="eta-$(openssl rand -hex 12)"
+            key_alias="eta"
+            key_password="$store_password"
+            keytool -genkeypair -noprompt -keystore "$keystore" -alias "$key_alias" \
+              -storepass "$store_password" -keypass "$key_password" \
+              -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=Eta Fork"
+            echo "::notice::未配置 ETA_RELEASE_* Secrets，普通包使用本次运行临时生成的签名。"
+          fi
+          {
+            echo "ETA_RELEASE_STORE_FILE=$keystore"
+            echo "ETA_RELEASE_STORE_PASSWORD=$store_password"
+            echo "ETA_RELEASE_KEY_ALIAS=$key_alias"
+            echo "ETA_RELEASE_KEY_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+
+      - name: 构建 Debug 包与普通包
         run: |
           metadata_arg=()
           if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
             metadata_arg=("-Peta.buildMetadata=${GITHUB_SHA::7}")
           fi
           ./gradlew --no-daemon --no-configuration-cache "${metadata_arg[@]}" \
-            :app:assembleDebug
+            :app:assembleDebug :app:assembleRelease
 
-      - name: 验证并整理 APK
-        id: apk
+      # 两种包分别校验、分别上传，Artifact 名称固定为 eta-debug-apk 与 eta-release-apk
+      - name: 整理 Debug 包
+        id: debug_apk
         run: |
-          # 文件名由 Gradle 按 versionName 生成，例如 Eta-vX.Y.Z-debug+<sha>.apk
           shopt -s nullglob
-          debug_apks=(app/build/outputs/apk/debug/Eta-v*.apk)
+          apks=(app/build/outputs/apk/debug/Eta-v*.apk)
+          if [[ ${#apks[@]} -ne 1 ]]; then
+            echo "::error::Debug 包数量异常（${#apks[@]}）。"
+            exit 1
+          fi
           apksigner_path="$(find "$ANDROID_HOME/build-tools" \
             -type f -name apksigner | sort -V | tail -n 1)"
+          "$apksigner_path" verify "${apks[0]}"
+          echo "path=${apks[0]}" >> "$GITHUB_OUTPUT"
 
-          if [[ ${#debug_apks[@]} -ne 1 ]]; then
-            echo "::error::Debug APK 数量异常（${#debug_apks[@]}）。"
+      - name: 整理普通包
+        id: release_apk
+        run: |
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/Eta-v*.apk)
+          if [[ ${#apks[@]} -ne 1 ]]; then
+            echo "::error::普通包数量异常（${#apks[@]}）。"
             exit 1
           fi
-          if [[ -z "$apksigner_path" ]]; then
-            echo "::error::未找到 apksigner。"
-            exit 1
-          fi
+          apksigner_path="$(find "$ANDROID_HOME/build-tools" \
+            -type f -name apksigner | sort -V | tail -n 1)"
+          "$apksigner_path" verify "${apks[0]}"
+          echo "path=${apks[0]}" >> "$GITHUB_OUTPUT"
 
-          "$apksigner_path" verify "${debug_apks[0]}"
-          echo "debug_path=${debug_apks[0]}" >> "$GITHUB_OUTPUT"
-
-      - name: 上传 Debug APK
+      - name: 上传 Debug 包
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          path: ${{ steps.apk.outputs.debug_path }}
+          name: eta-debug-apk
+          path: ${{ steps.debug_apk.outputs.path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传普通包
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: eta-release-apk
+          path: ${{ steps.release_apk.outputs.path }}
           archive: false
           if-no-files-found: error
           retention-days: 14
